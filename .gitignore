@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+dataset/
+Screen/
+Research Paper/
+*.mp4
+*.docx
+*.pdf
+quick_model.pth
+.venv/
