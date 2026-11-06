@@ -35,6 +35,8 @@ DATASET_PATH = "dataset"
 ECZEMA_PATH = os.path.join(DATASET_PATH, "Eczema")
 NORMAL_PATH = os.path.join(DATASET_PATH, "Normal")
 MODEL_PATH = os.path.join("model", "best_model.pth")
+COUNTERFACTUAL_STEPS = 100
+COUNTERFACTUAL_LR = 0.01
 
 
 class EczemaClassifier(nn.Module):
@@ -288,6 +290,46 @@ def generate_shap_explanation(model, device, image_array, target_class):
         return np.clip(overlay, 0, 1)
     except Exception as e:
         st.error(f"SHAP Error: {e}")
+        return None
+
+def generate_counterfactual(model, device, image_tensor, target_class):
+    """Perturb the image until the model flips its prediction.
+
+    Returns (counterfactual_rgb, perturbation_map, target_prob, steps_used)
+    or None on failure.
+    """
+    try:
+        model.eval()
+        x_orig = image_tensor.unsqueeze(0).to(device).clone().detach()
+        x_adv = x_orig.clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([x_adv], lr=COUNTERFACTUAL_LR)
+
+        # Normalization constants for valid pixel-range clamping
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+        prob = 0.0
+        steps_used = 0
+        for step in range(COUNTERFACTUAL_STEPS):
+            optimizer.zero_grad()
+            output = model(x_adv)
+            loss = -output[0, target_class]
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                x_adv.data = torch.clamp(x_adv.data, -mean / std, (1 - mean) / std)
+            prob = F.softmax(output.detach(), dim=1)[0, target_class].item()
+            steps_used = step + 1
+            if prob > 0.6 and step >= 5:
+                break
+
+        with torch.no_grad():
+            orig_img = (x_orig * std + mean).clamp(0, 1)[0].cpu().numpy().transpose(1, 2, 0)
+            adv_img = (x_adv * std + mean).clamp(0, 1)[0].cpu().numpy().transpose(1, 2, 0)
+        diff = np.abs(adv_img - orig_img)
+        return adv_img, diff, prob, steps_used
+    except Exception as e:
+        st.error(f"Counterfactual Error: {e}")
         return None
 
 def get_dataset_statistics():
@@ -734,6 +776,54 @@ def main():
                     st.success(
                         "SHAP explanation generated successfully."
                     )
+            
+            # Counterfactual explanation (below the images)
+            st.markdown("---")
+            st.markdown("### 🔄 Counterfactual Explanation")
+            st.write(
+                "A counterfactual shows the minimal change to the image "
+                "that would flip the model's prediction."
+            )
+            
+            if st.button("Generate Counterfactual", key="cf_btn"):
+                target_class = 1 - predicted_class
+                target_name = CLASS_NAMES[target_class]
+                with st.spinner(f"Searching for counterfactual towards '{target_name}'..."):
+                    cf = generate_counterfactual(
+                        model, device, image_tensor, target_class
+                    )
+                if cf is not None:
+                    adv_img, diff, prob, steps_used = cf
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.image(
+                            cv2.resize(image_array, (224, 224)),
+                            caption=f"Original — {class_name} ({confidence:.1%})",
+                            use_container_width=True
+                        )
+                    with col2:
+                        st.image(
+                            adv_img,
+                            caption=f"Counterfactual — {target_name} ({prob:.1%})",
+                            use_container_width=True
+                        )
+                    with col3:
+                        diff_norm = diff / (diff.max() + 1e-8)
+                        st.image(
+                            diff_norm,
+                            caption="Perturbation Map",
+                            use_container_width=True
+                        )
+                    
+                    st.success(
+                        f"Counterfactual found in {steps_used} steps: "
+                        f"the model now predicts **{target_name}** with "
+                        f"{prob:.1%} confidence. The perturbation map shows "
+                        "which pixels were changed."
+                    )
+                else:
+                    st.warning("Could not generate a counterfactual for this image.")
     
     elif page == "📈 Performance Dashboard":
         st.markdown("## 📊 Comprehensive Performance Dashboard")
