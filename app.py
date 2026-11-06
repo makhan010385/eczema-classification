@@ -163,14 +163,11 @@ def load_model():
 
 def preprocess_image(image):
     """Preprocess uploaded image"""
-    # Convert PIL to numpy array
-    image_array = np.array(image)
-    
-    # Apply transforms
+    image = image.convert("RGB")
+    image_array = np.array(image, dtype=np.uint8)
     transform = get_test_transform()
     transformed = transform(image=image_array)
-    
-    return transformed['image'], image_array
+    return transformed["image"], image_array
 
 def predict_image(model, device, image_tensor):
     """Make prediction on image"""
@@ -188,63 +185,110 @@ def predict_image(model, device, image_tensor):
 def generate_grad_cam(model, device, image_tensor, target_class):
     """Generate Grad-CAM visualization"""
     try:
-        # Define the target layer
+        model.eval()
+        model.zero_grad()
         target_layers = [model.backbone.layer4[-1]]
-        
-        # Create GradCAM object
-        cam = GradCAM(model=model, target_layers=target_layers)
-        
-        # Define targets
-        targets = [ClassifierOutputTarget(target_class)]
-        
-        # Generate CAM
-        grayscale_cam = cam(input_tensor=image_tensor.unsqueeze(0).to(device), targets=targets)
-        grayscale_cam = grayscale_cam[0, :]
-        
-        return grayscale_cam
+        with GradCAM(
+            model=model,
+            target_layers=target_layers
+        ) as cam:
+            targets = [
+                ClassifierOutputTarget(int(target_class))
+            ]
+            grayscale_cam = cam(
+                input_tensor=image_tensor.unsqueeze(0).to(device),
+                targets=targets
+            )
+        return grayscale_cam[0]
     except Exception as e:
-        st.error(f"Error generating Grad-CAM: {str(e)}")
+        st.error(f"Grad-CAM Error: {e}")
         return None
 
 def generate_lime_explanation(model, image_array, predict_fn):
     """Generate LIME explanation"""
     try:
         explainer = lime_image.LimeImageExplainer()
-        
-        # Resize image to reasonable size for LIME
-        image_resized = cv2.resize(image_array, (224, 224))
-        
+        image_resized = cv2.resize(
+            image_array,
+            (224, 224)
+        )
         explanation = explainer.explain_instance(
-            image_resized.astype('double'),
+            image_resized,
             predict_fn,
             top_labels=2,
             hide_color=0,
-            num_samples=100
+            num_samples=500
         )
-        
         return explanation
     except Exception as e:
-        st.error(f"Error generating LIME explanation: {str(e)}")
+        st.error(f"LIME Error: {e}")
         return None
 
 def model_predict_fn(images, model, device):
-    """Prediction function for LIME"""
+    """Prediction function for LIME/SHAP"""
     model.eval()
-    predictions = []
-    
+    batch = []
+    transform = get_test_transform()
     for img in images:
-        # Convert to tensor
-        transform = get_test_transform()
+        img = np.asarray(img).astype(np.uint8)
         transformed = transform(image=img)
-        image_tensor = transformed['image']
-        
-        with torch.no_grad():
-            image_tensor = image_tensor.unsqueeze(0).to(device)
-            outputs = model(image_tensor)
-            probs = F.softmax(outputs, dim=1)
-            predictions.append(probs[0].cpu().numpy())
-    
-    return np.array(predictions)
+        batch.append(transformed["image"])
+    batch = torch.stack(batch).to(device)
+    with torch.no_grad():
+        outputs = model(batch)
+        probabilities = F.softmax(outputs, dim=1)
+    return probabilities.cpu().numpy()
+
+def generate_shap_explanation(model, device, image_array, target_class):
+    """Generate SHAP explanation visualization"""
+    try:
+        model.eval()
+        image_resized = cv2.resize(
+            image_array,
+            (224, 224)
+        ).astype(np.uint8)
+
+        def predict_fn(images):
+            return model_predict_fn(
+                images, model, device
+            )
+
+        masker = shap.maskers.Image(
+            "blur(32,32)",
+            image_resized.shape
+        )
+        explainer = shap.Explainer(
+            predict_fn,
+            masker,
+            output_names=CLASS_NAMES
+        )
+        shap_values = explainer(
+            image_resized[np.newaxis, ...],
+            max_evals=200,
+            batch_size=16
+        )
+        values = np.asarray(shap_values.values)
+
+        # values shape: (batch, H, W, C, num_outputs)
+        class_values = values[0, :, :, :, int(target_class)]
+        attribution = np.abs(class_values).sum(axis=-1)
+        attribution = (attribution - attribution.min()) / (
+            attribution.max() - attribution.min() + 1e-8
+        )
+
+        # Overlay SHAP heatmap on original image
+        original_float = image_resized.astype(np.float32) / 255.0
+        heatmap = cv2.applyColorMap(
+            np.uint8(255 * attribution),
+            cv2.COLORMAP_JET
+        )
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        heatmap = heatmap.astype(np.float32) / 255.0
+        overlay = 0.5 * original_float + 0.5 * heatmap
+        return np.clip(overlay, 0, 1)
+    except Exception as e:
+        st.error(f"SHAP Error: {e}")
+        return None
 
 def get_dataset_statistics():
     """Get dataset statistics"""
@@ -615,17 +659,24 @@ def main():
                 grad_cam = generate_grad_cam(model, device, image_tensor, predicted_class)
                 
                 if grad_cam is not None:
-                    # Overlay Grad-CAM on original image
-                    original_resized = cv2.resize(image_array, (224, 224))
-                    heatmap = cv2.applyColorMap(np.uint8(255 * grad_cam), cv2.COLORMAP_JET)
-                    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-                    superimposed = cv2.addWeighted(original_resized, 0.6, heatmap, 0.4, 0)
-                    
+                    original = cv2.resize(image_array, (224, 224))
+                    original_float = original.astype(np.float32) / 255.0
+                    heatmap = cv2.applyColorMap(
+                        np.uint8(255 * grad_cam),
+                        cv2.COLORMAP_JET
+                    )
+                    heatmap = cv2.cvtColor(
+                        heatmap,
+                        cv2.COLOR_BGR2RGB
+                    )
+                    heatmap = heatmap.astype(np.float32) / 255.0
+                    overlay = 0.5 * original_float + 0.5 * heatmap
+                    overlay = np.clip(overlay, 0, 1)
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.image(original_resized, caption="Original Image", use_container_width=True)
+                        st.image(original, caption="Original Image")
                     with col2:
-                        st.image(superimposed, caption="Grad-CAM Heatmap", use_container_width=True)
+                        st.image(overlay, caption="Grad-CAM Explanation")
                     
                     st.info("🔥 Red areas indicate regions that strongly influenced the prediction.")
             
@@ -640,34 +691,49 @@ def main():
                 lime_exp = generate_lime_explanation(model, image_array, predict_fn_lime)
                 
                 if lime_exp is not None:
-                    # Get explanation for the predicted class
                     temp, mask = lime_exp.get_image_and_mask(
-                        predicted_class, 
-                        positive_only=True, 
-                        num_features=5, 
+                        predicted_class,
+                        positive_only=True,
+                        num_features=10,
                         hide_rest=False
                     )
-                    
-                    # Create boundary visualization
-                    img_boundry = mark_boundaries(temp/255.0, mask)
-                    
+                    lime_image_result = mark_boundaries(
+                        temp / 255.0,
+                        mask
+                    )
                     col1, col2 = st.columns(2)
                     with col1:
                         st.image(image_array, caption="Original Image", use_container_width=True)
                     with col2:
-                        st.image(img_boundry, caption="LIME Explanation", use_container_width=True)
-                    
+                        st.image(
+                            lime_image_result,
+                            caption="LIME Explanation",
+                            use_container_width=True
+                        )
                     st.info("🍋 Green areas show regions that support the prediction.")
             
             with tab3:
                 st.markdown("### 📊 SHAP Analysis")
-                st.markdown("**SHAP (SHapley Additive exPlanations)** provides pixel-level importance scores.")
-                
-                st.info("📊 SHAP analysis is computationally intensive and may take a moment...")
-                
-                # Placeholder for SHAP (would need implementation)
-                st.image(image_array, caption="Original Image", use_container_width=True)
-                st.warning("📊 SHAP visualization requires additional implementation.")
+                st.write(
+                    "SHAP highlights image regions contributing "
+                    "to the selected model prediction."
+                )
+                with st.spinner("Generating SHAP explanation..."):
+                    shap_result = generate_shap_explanation(
+                        model,
+                        device,
+                        image_array,
+                        predicted_class
+                    )
+                if shap_result is not None:
+                    st.image(
+                        shap_result,
+                        caption=f"SHAP Explanation - {class_name}",
+                        use_container_width=True
+                    )
+                    st.success(
+                        "SHAP explanation generated successfully."
+                    )
     
     elif page == "📈 Performance Dashboard":
         st.markdown("## 📊 Comprehensive Performance Dashboard")
