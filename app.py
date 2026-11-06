@@ -1,6 +1,8 @@
 import streamlit as st
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 import numpy as np
 import cv2
 from PIL import Image
@@ -12,9 +14,6 @@ from plotly.subplots import make_subplots
 import os
 import pandas as pd
 from datetime import datetime
-import config
-from model import get_model
-from data_preprocessing import get_transforms
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import shap
@@ -23,6 +22,49 @@ from lime import lime_image
 from skimage.segmentation import mark_boundaries
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+# Configuration
+IMG_SIZE = (224, 224)
+NUM_CLASSES = 2
+CLASS_NAMES = ['Normal', 'Eczema']
+CLASS_COLORS = {
+    'Normal': '#2E8B57',  # Sea green
+    'Eczema': '#DC143C'   # Crimson
+}
+DATASET_PATH = "dataset"
+ECZEMA_PATH = os.path.join(DATASET_PATH, "Eczema")
+NORMAL_PATH = os.path.join(DATASET_PATH, "Normal")
+MODEL_PATH = os.path.join("model", "best_model.pth")
+
+
+class EczemaClassifier(nn.Module):
+    """ResNet-50 based classifier for eczema detection"""
+    def __init__(self):
+        super(EczemaClassifier, self).__init__()
+        self.backbone = models.resnet50(weights=None)
+        num_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_features, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+def get_test_transform():
+    """Preprocessing pipeline for inference"""
+    return A.Compose([
+        A.Resize(height=IMG_SIZE[0], width=IMG_SIZE[1]),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2()
+    ])
 
 # Page configuration
 st.set_page_config(
@@ -108,11 +150,11 @@ st.markdown("""
 def load_model():
     """Load the trained model"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = get_model('resnet').to(device)
+    model = EczemaClassifier().to(device)
     
     # Load best model if exists
-    if os.path.exists('best_model.pth'):
-        checkpoint = torch.load('best_model.pth', map_location=device)
+    if os.path.exists(MODEL_PATH):
+        checkpoint = torch.load(MODEL_PATH, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         return model, device, True
@@ -125,7 +167,7 @@ def preprocess_image(image):
     image_array = np.array(image)
     
     # Apply transforms
-    transform = get_transforms('test')
+    transform = get_test_transform()
     transformed = transform(image=image_array)
     
     return transformed['image'], image_array
@@ -192,7 +234,7 @@ def model_predict_fn(images, model, device):
     
     for img in images:
         # Convert to tensor
-        transform = get_transforms('test')
+        transform = get_test_transform()
         transformed = transform(image=img)
         image_tensor = transformed['image']
         
@@ -207,9 +249,9 @@ def model_predict_fn(images, model, device):
 def get_dataset_statistics():
     """Get dataset statistics"""
     try:
-        eczema_files = [f for f in os.listdir(config.ECZEMA_PATH) 
+        eczema_files = [f for f in os.listdir(ECZEMA_PATH) 
                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
-        normal_files = [f for f in os.listdir(config.NORMAL_PATH) 
+        normal_files = [f for f in os.listdir(NORMAL_PATH) 
                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
         
         return {
@@ -438,8 +480,8 @@ def main():
                 st.markdown("### 🎯 AI Prediction Results")
                 
                 # Display prediction with enhanced UI
-                class_name = config.CLASS_NAMES[predicted_class]
-                color = config.CLASS_COLORS[class_name]
+                class_name = CLASS_NAMES[predicted_class]
+                color = CLASS_COLORS[class_name]
                 
                 st.markdown(f"""
                 <div class="metric-card" style="border-left: 5px solid {color};">
@@ -450,8 +492,8 @@ def main():
                 
                 # Probability distribution
                 fig = go.Figure(data=[
-                    go.Bar(name='Probability', x=config.CLASS_NAMES, y=probs,
-                          marker_color=[config.CLASS_COLORS[name] for name in config.CLASS_NAMES],
+                    go.Bar(name='Probability', x=CLASS_NAMES, y=probs,
+                          marker_color=[CLASS_COLORS[name] for name in CLASS_NAMES],
                           text=[f'{p:.1%}' for p in probs],
                           textposition='auto')
                 ])
@@ -555,7 +597,7 @@ def main():
             predicted_class, confidence, probs = predict_image(model, device, image_tensor)
             
             # Display prediction
-            class_name = config.CLASS_NAMES[predicted_class]
+            class_name = CLASS_NAMES[predicted_class]
             st.markdown(f"""
             <div class="metric-card">
                 <h3>Prediction: {class_name} (Confidence: {confidence:.1%})</h3>
@@ -663,10 +705,10 @@ def main():
                 # Class-wise performance
                 if real:
                     class_metrics = pd.DataFrame({
-                        'Class': config.CLASS_NAMES,
-                        'Precision': [real['per_class'][n]['precision'] for n in config.CLASS_NAMES],
-                        'Recall': [real['per_class'][n]['recall'] for n in config.CLASS_NAMES],
-                        'F1-Score': [real['per_class'][n]['f1'] for n in config.CLASS_NAMES]
+                        'Class': CLASS_NAMES,
+                        'Precision': [real['per_class'][n]['precision'] for n in CLASS_NAMES],
+                        'Recall': [real['per_class'][n]['recall'] for n in CLASS_NAMES],
+                        'F1-Score': [real['per_class'][n]['f1'] for n in CLASS_NAMES]
                     })
                 else:
                     class_metrics = pd.DataFrame({

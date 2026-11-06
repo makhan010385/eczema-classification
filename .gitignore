@@ -1,10 +1,10 @@
-__pycache__/
-*.pyc
-dataset/
-Screen/
-Research Paper/
-*.mp4
-*.docx
-*.pdf
-quick_model.pth
-.venv/
+# Ignore everything by default
+*
+
+# Only these are pushed to GitHub
+!.gitignore
+!.gitattributes
+!app.py
+!requirements.txt
+!model/
+!model/best_model.pth
