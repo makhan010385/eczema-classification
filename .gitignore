@@ -8,3 +8,6 @@
 !requirements.txt
 !model/
 !model/best_model.pth
+!metrics.json
+!confusion_matrix.png
+!roc_curve.png
